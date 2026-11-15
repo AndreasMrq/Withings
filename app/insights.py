@@ -137,6 +137,41 @@ def welch(x, y):
     return mx - my, d, t_pvalue(t, df)
 
 
+def _t_crit(df, alpha=0.05):
+    """Two-sided critical t via bisection on t_pvalue (p decreases monotonically in t)."""
+    lo, hi = 0.0, 1000.0
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        lo, hi = (mid, hi) if t_pvalue(mid, df) > alpha else (lo, mid)
+    return (lo + hi) / 2
+
+
+def welch_ci(x, y, alpha=0.05):
+    """95% CI (lo, hi) for mean(x) - mean(y) using the Welch SE and Welch-Satterthwaite df."""
+    nx, ny = len(x), len(y)
+    mx, my = sum(x) / nx, sum(y) / ny
+    vx = sum((v - mx) ** 2 for v in x) / (nx - 1)
+    vy = sum((v - my) ** 2 for v in y) / (ny - 1)
+    se2 = vx / nx + vy / ny
+    if se2 <= 0:
+        return mx - my, mx - my
+    df = se2 ** 2 / ((vx / nx) ** 2 / max(1, nx - 1) + (vy / ny) ** 2 / max(1, ny - 1))
+    h = _t_crit(df, alpha) * math.sqrt(se2)
+    return mx - my - h, mx - my + h
+
+
+def bh_adjust(pvalues):
+    """Benjamini-Hochberg FDR q-values (step-up, monotone), in input order."""
+    n = len(pvalues)
+    order = sorted(range(n), key=lambda i: pvalues[i])
+    q, prev = [0.0] * n, 1.0
+    for rank in range(n, 0, -1):
+        i = order[rank - 1]
+        prev = min(prev, pvalues[i] * n / rank)
+        q[i] = prev
+    return q
+
+
 def _ranks(v):
     order = sorted(range(len(v)), key=lambda i: v[i])
     r = [0.0] * len(v)
@@ -207,9 +242,12 @@ def daily_table() -> dict[str, dict]:
             m["sleep_deep_pct"] = 100 * (m.get("sleep_deep_s") or 0) / m["sleep_total_s"]
         m["_tags"] = set()
         m["_moods"], m["_energies"] = [], []
+        m["_logged"] = False
     for e in entries(limit=100000):
         d = journal_day(e["ts"], zone).isoformat()
-        m = rows.setdefault(d, {"date": d, "_tags": set(), "_moods": [], "_energies": []})
+        m = rows.setdefault(d, {"date": d, "_tags": set(), "_moods": [], "_energies": [],
+                                 "_logged": False})
+        m["_logged"] = True  # any entry (tags, mood, energy or note) makes it a logged day
         m["_tags"].update(e["tags"])
         if e["mood"]:
             m["_moods"].append(e["mood"])
@@ -234,19 +272,21 @@ def _fmt(v, unit):
 
 
 def analyze(min_n: int = 3) -> dict:
+    min_n = max(2, int(min_n))  # welch divides by n-1
     rows = daily_table()
     dates = sorted(rows)
-    journal_days = [d for d in dates if rows[d]["_tags"] or rows[d]["mood"] is not None]
+    journal_days = [d for d in dates if rows[d]["_logged"]]
     if not journal_days:
         return {"tag_effects": [], "mood_drivers": [], "journal_days": 0, "tags": []}
     first_journal = journal_days[0]
     days = [d for d in dates if d >= first_journal]  # compare only within the journaling period
+    logged = [d for d in days if rows[d]["_logged"]]  # missing is not absent: unlogged days are excluded
 
     def shifted(d, off):
         return (dt.date.fromisoformat(d) + dt.timedelta(days=off)).isoformat()
 
     all_tags = sorted({t for d in days for t in rows[d]["_tags"]})
-    findings, per_tag = [], []
+    per_tag, all_effs = [], []
     for tag in all_tags:
         tagged = [d for d in days if tag in rows[d]["_tags"]]
         if len(tagged) < min_n:
@@ -255,7 +295,7 @@ def analyze(min_n: int = 3) -> dict:
         effs = []
         for key, label, off, higher_better, unit in EFFECTS:
             x, y = [], []
-            for d in days:
+            for d in logged:
                 v = rows.get(shifted(d, off), {}).get(key)
                 if v is None:
                     continue
@@ -263,6 +303,7 @@ def analyze(min_n: int = 3) -> dict:
             if len(x) < min_n or len(y) < min_n:
                 continue
             diff, dsz, p = welch(x, y)
+            lo, hi = welch_ci(x, y)
             my = sum(y) / len(y)
             pct = 100 * diff / my if my else None
             good = (diff > 0) == higher_better
@@ -270,21 +311,25 @@ def analyze(min_n: int = 3) -> dict:
                 "tag": tag, "metric": key, "label": label, "offset": off, "unit": unit,
                 "with": round(sum(x) / len(x), 2), "without": round(my, 2),
                 "diff": round(diff, 2), "pct": round(pct, 1) if pct is not None else None,
-                "d": round(dsz, 2), "p": round(p, 4), "n_with": len(x), "n_without": len(y),
+                "d": round(dsz, 2), "p": round(p, 4), "ci_low": round(lo, 2), "ci_high": round(hi, 2), "_p": p, "n_with": len(x), "n_without": len(y),
                 "good": good,
-                "strength": "strong" if p < 0.05 and abs(dsz) >= 0.5 else
-                            "likely" if p < 0.1 else "possible" if p < 0.25 and abs(dsz) >= 0.3 else "none",
             }
             direction = "higher" if diff > 0 else "lower"
+            amount = f"{abs(pct):.0f}%" if pct is not None else _fmt(abs(diff), unit)
             e["sentence"] = (
-                f"{label} was {abs(e['pct'] or 0):.0f}% {direction} on '{tag}' days "
+                f"{label} was {amount} {direction} on '{tag}' days "
                 f"({_fmt(e['with'], unit)} vs {_fmt(e['without'], unit)}, n={len(x)})."
             )
             effs.append(e)
-            if e["strength"] != "none":
-                findings.append(e)
+            all_effs.append(e)
         per_tag.append({"tag": tag, "n": len(tagged), "effects": effs})
-    findings.sort(key=lambda e: (e["p"], -abs(e["d"])))
+    for e, q in zip(all_effs, bh_adjust([e.pop("_p") for e in all_effs])):
+        a = abs(e["d"])
+        e["q"] = round(q, 4)
+        e["strength"] = ("strong" if q < 0.05 and a >= 0.5 else "likely" if q < 0.10 and a >= 0.3 else
+                         "possible" if q < 0.20 and a >= 0.3 else "none")
+    findings = [e for e in all_effs if e["strength"] != "none"]
+    findings.sort(key=lambda e: (e["q"], -abs(e["d"])))
 
     drivers = []
     for target, tlabel in (("mood", "Mood"), ("self_energy", "Felt energy")):
@@ -295,7 +340,9 @@ def analyze(min_n: int = 3) -> dict:
                 continue
             r, p = spearman([a for a, _ in pairs], [b for _, b in pairs])
             drivers.append({"target": target, "target_label": tlabel, "metric": key, "label": label,
-                            "r": round(r, 2), "p": round(p, 4), "n": len(pairs)})
+                            "r": round(r, 2), "p": round(p, 4), "_p": p, "n": len(pairs)})
+    for dr, q in zip(drivers, bh_adjust([dr.pop("_p") for dr in drivers])):
+        dr["q"] = round(q, 4)
     drivers.sort(key=lambda x: -abs(x["r"]))
 
     tag_counts = sorted(((t, sum(1 for d in days if t in rows[d]["_tags"])) for t in all_tags),
