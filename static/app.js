@@ -138,6 +138,27 @@ function parts(obj, labels) {
   }).join('')}</div>`;
 }
 
+const STRAIN_TONE = { normal: 'good', watch: 'warn', alert: 'bad' };
+const STRAIN_SIG = { rhr: ['Resting HR', 'bpm', 0, 1], hrv: ['HRV', 'ms', 1, -1], respiration: ['Breathing rate', 'brpm', 1, 1], skin_temp: ['Skin temp', '°C', 2, 1], spo2_night: ['Night SpO₂', '%', 1, -1] }; // label, unit, decimals, worse direction
+const ordinal = (n) => `${n}${[, 'st', 'nd', 'rd'][n % 100 > 3 && n % 100 < 21 ? 0 : n % 10] || 'th'}`;
+const clockH = (ts, wrap) => { const t = new Date(ts * 1000); const h = t.getHours() + t.getMinutes() / 60; return +(wrap && h < 12 ? h + 24 : h).toFixed(2); };
+const hhmm = (h) => { const m = Math.round(((h % 24) + 24) % 24 * 60); return `${String(Math.floor(m / 60) % 24).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`; };
+function strainCard(m) {
+  const sig = m.strain_signals || {}; const keys = Object.keys(STRAIN_SIG).filter((k) => sig[k]);
+  const note = '<p class="small muted">Early-warning hint from your own overnight data, not a medical device.</p>';
+  if (!m.strain_level || keys.length < 2) return `<div class="card mt"><div class="card-head"><h3>Body signals</h3></div><p class="muted">Building baseline — needs about two weeks of nights to compare against.</p>${note}</div>`;
+  const hi = keys.filter((k) => sig[k].z >= 1.5);
+  const phrase = (dir) => { const n = hi.filter((k) => STRAIN_SIG[k][3] === dir).map((k) => STRAIN_SIG[k][0].toLowerCase()); return n.length ? `${n.join(' and ')} ${n.length > 1 ? 'are' : 'is'} ${dir > 0 ? 'above' : 'below'} your baseline` : ''; };
+  const sent = hi.length && m.strain_level !== 'normal'
+    ? `${[phrase(1), phrase(-1)].filter(Boolean).join(' and ').replace(/^./, (c) => c.toUpperCase())}${m.strain_streak > 1 ? ` for the ${ordinal(m.strain_streak)} day` : ''} — consider taking it easy.` : '';
+  return `<div class="card mt"><div class="card-head"><h3>Body signals</h3><span class="hint">last night vs. your 28-day baseline</span>${badge(m.strain_level, STRAIN_TONE[m.strain_level])}</div>
+    ${sent ? `<p>${esc(sent)}</p>` : ''}
+    <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Signal</th><th class="r">Last night</th><th class="r">Baseline</th><th class="r">Deviation</th></tr></thead><tbody>
+    ${keys.map((k) => { const [lbl, unit, dg] = STRAIN_SIG[k]; const s = sig[k]; const diff = s.value - s.baseline; const tone = s.z >= 2.5 ? 'bad' : s.z >= 1.5 ? 'warn' : 'good';
+      return `<tr><td>${lbl}</td><td class="r">${fmt(s.value, dg)} ${unit}</td><td class="r muted">${fmt(s.baseline, dg)} ${unit}</td><td class="r">${badge(`${diff > 0 ? '+' : ''}${fmt(diff, dg)} ${unit}`, tone)}</td></tr>`; }).join('')}
+    </tbody></table></div>${note}</div>`;
+}
+
 // ------------------------------------------------------------------------------------
 // router
 // ------------------------------------------------------------------------------------
@@ -219,6 +240,8 @@ async function viewToday(view, date) {
     ${m.weight ? tile('Weight', fmt(m.weight, 1), 'kg', m.fat_ratio ? `body fat ${fmt(m.fat_ratio, 1)}%` : '') : ''}
     ${m.skin_temp ? tile('Skin temp', fmt(m.skin_temp, 2), '°C', '') : ''}
   </div>
+
+  ${strainCard(m)}
 
   <div class="grid g2 mt">
     <div class="card span2"><div class="card-head"><h3>Heart rate</h3><span class="hint">shaded = sleep · max ${fmt(m.hr_max)} bpm</span></div><div class="chart-box"><canvas id="cHr"></canvas></div></div>
@@ -307,8 +330,15 @@ async function viewSleep(view, date) {
     <div class="card"><div class="card-head"><h3>Heart rate during sleep</h3></div><div class="chart-box short"><canvas id="cSHr"></canvas></div></div>
     <div class="card"><div class="card-head"><h3>HRV during sleep</h3><span class="hint">RMSSD, 5-min</span></div><div class="chart-box short"><canvas id="cSHrv"></canvas></div></div>
   </div>` : '<div class="card empty"><h2>No sleep recorded</h2><p>No sleep session ends on this day.</p></div>'}
+  <div class="grid tiles mt">
+    ${tile('Regularity', fmt(m.sleep_regularity), '/100', 'bed & wake time consistency, 7 nights', '', m.sleep_regularity != null ? badge(m.sleep_regularity >= 75 ? 'regular' : m.sleep_regularity >= 50 ? 'variable' : 'irregular', scoreTone(m.sleep_regularity)) : '')}
+    ${tile('Bedtime variability', m.bedtime_sd_min != null ? '±' + fmt(m.bedtime_sd_min) : '–', 'min', m.waketime_sd_min != null ? `wake-up ±${fmt(m.waketime_sd_min)} min` : 'needs 4 nights')}
+    ${tile('Social jetlag', fmt(m.social_jetlag_min), 'min', m.social_jetlag_min != null ? 'free vs. work-day midpoint' : 'needs 2 free and 2 work nights')}
+    ${tile('Sleep debt', fmt(m.sleep_debt_h, 1), 'h', 'last 7 nights vs. your target')}
+  </div>
   <div class="card mt"><div class="card-head"><h3>Last 30 nights</h3><span class="hint">hours per stage</span></div><div class="chart-box tall"><canvas id="cS30"></canvas></div></div>
   <div class="card mt"><div class="card-head"><h3>Sleep score · 30 nights</h3></div><div class="chart-box short"><canvas id="cS30s"></canvas></div></div>
+  <div class="card mt"><div class="card-head"><h3>Bedtime & wake-up · 30 nights</h3><span class="hint">when you slept, local clock time</span></div><div class="chart-box"><canvas id="cS30t"></canvas></div></div>
   `;
   if (has) {
     $('#hypno').innerHTML = hypnogram(d.sleep_states, m.sleep_start, m.sleep_end);
@@ -329,6 +359,9 @@ async function viewSleep(view, date) {
     { label: 'Awake', data: h('sleep_awake_s'), backgroundColor: css('--awake') },
   ].map((x) => ({ ...x, borderColor: css('--surface'), borderWidth: { top: 2 }, borderRadius: 0 })), { stacked: true, legend: true, tooltip: hTip });
   dateLine($('#cS30s'), dates, [lineDs('Sleep score', tr.map((x) => x.sleep_score), css('--blue'), { pointRadius: 2 })], { y: { suggestedMin: 40, max: 100 } });
+  const bedH = (ts) => { const h = clockH(ts, false); return h > 12 ? +(h - 24).toFixed(2) : h; }; // before midnight = negative
+  dateBars($('#cS30t'), dates, [{ label: 'Asleep', data: tr.map((x) => (x.sleep_start && x.sleep_end ? [bedH(x.sleep_start), clockH(x.sleep_end, false)] : null)), backgroundColor: css('--violet'), borderSkipped: false }],
+    { y: { reverse: true, ticks: { stepSize: 2, callback: (v) => hhmm(v) } }, tooltip: { label: (i) => (i.raw ? ` ${hhmm(i.raw[0])} → ${hhmm(i.raw[1])}` : null) } });
 }
 function hypnogram(states, s0, s1) {
   const W = 1000; const H = 150; const pad = 44; const rows = { 0: 0, 3: 1, 1: 2, 2: 3 }; const rowH = (H - 24) / 4;
@@ -373,6 +406,8 @@ async function viewTrends(view, rangeArg) {
     ${card('tSteps', 'Steps')}
     ${card('tVo2', 'VO₂ max', tr.some((x) => x.vo2max_source === 'withings') ? 'Withings cardio fitness' : 'estimated from HRmax / resting HR')}
     ${card('tResp', 'Respiration rate (sleep)', 'breaths / min')}
+    ${tr.some((x) => x.strain_score != null) ? card('tStrain', 'Body strain', '0–100 · deviation of overnight signals from your baseline') : ''}
+    ${tr.some((x) => x.sleep_regularity != null) ? card('tReg', 'Sleep regularity', '0–100 · bed & wake time consistency') : ''}
     ${tr.some((x) => x.weight) ? card('tWeight', 'Weight', 'kg') : ''}
   </div>`;
   const hrv = col('hrv');
@@ -391,6 +426,8 @@ async function viewTrends(view, rangeArg) {
   dateBars($('#tSteps'), dates, [{ label: 'Steps', data: col('steps'), backgroundColor: css('--blue') }]);
   dateLine($('#tVo2'), dates, [lineDs('VO₂ max', col('vo2max'), css('--green'))], { tooltip: { label: (i) => ` VO₂ max ${fmt(i.parsed.y, 1)}` } });
   dateLine($('#tResp'), dates, [lineDs('Respiration', col('respiration'), css('--blue'), { pointRadius: 1.5 })]);
+  if ($('#tStrain')) dateLine($('#tStrain'), dates, [lineDs('Strain', col('strain_score'), css('--orange'), { pointRadius: 1.5 })], { y: { min: 0, max: 100 } });
+  if ($('#tReg')) dateLine($('#tReg'), dates, [lineDs('Regularity', col('sleep_regularity'), css('--violet'), { pointRadius: 1.5 })], { y: { min: 0, max: 100 } });
   if ($('#tWeight')) dateLine($('#tWeight'), dates, [lineDs('Weight', col('weight'), css('--ink-2'), { stepped: true })], { tooltip: { label: (i) => ` ${fmt(i.parsed.y, 1)} kg` } });
 }
 
@@ -457,11 +494,11 @@ async function viewInsights(view, tagArg) {
   const tagChip = (t) => `<button class="chip ${t.tag === sel ? 'on' : ''}" onclick="location.hash='#/insights/${encodeURIComponent(t.tag)}'">${tagEmoji(t.tag)} ${esc(t.tag)} <span class="muted">${t.n}</span></button>`;
   view.innerHTML = `
   <div class="page-head"><h2>Insights</h2><span class="muted small">${ins.journal_days} journal days · ${ins.period_days} days analysed</span></div>
-  <div class="card"><div class="card-head"><h3>Top patterns</h3><span class="hint">tagged days vs. all other days</span></div>
+  <div class="card"><div class="card-head"><h3>Top patterns</h3><span class="hint">tagged days vs. other logged days</span></div>
     ${ins.findings.length ? `<div class="grid" style="gap:12px">${ins.findings.slice(0, 10).map((f) => `
       <div class="finding"><div class="stripe" style="background:${f.good ? css('--good') : css('--critical')}"></div>
         <div><div>${f.good ? '▲' : '▼'} ${esc(f.sentence)}</div>
-        <div class="meta">${f.good ? 'favourable' : 'unfavourable'} · ${strengthLbl[f.strength]} · p=${f.p < 0.001 ? '<0.001' : f.p.toFixed(3)} · effect size d=${f.d}</div></div></div>`).join('')}</div>`
+        <div class="meta">${f.good ? 'favourable' : 'unfavourable'} · ${strengthLbl[f.strength]} · adjusted p=${f.q < 0.001 ? '<0.001' : f.q.toFixed(3)} · 95% range ${fmt(f.ci_low, 1)} to ${fmt(f.ci_high, 1)}${f.unit && f.unit !== '/5' ? ' ' + f.unit : ''} · effect size d=${f.d}</div></div></div>`).join('')}</div>`
       : '<p class="muted">No clear patterns yet. Keep logging — a tag needs at least 3 occurrences, and patterns usually emerge after 3–6 weeks.</p>'}
     <p class="small muted mt">These are correlations from your own data, not proof of cause. With many comparisons some "possible" findings will be chance — trust patterns that stay strong as data grows.</p></div>
 
@@ -486,7 +523,7 @@ async function viewInsights(view, tagArg) {
 function fmtUnit(v, u) { return u === 'h' ? fmt(v, 1) + ' h' : u === '%' ? fmt(v) + '%' : u === '/5' ? fmt(v, 1) : u ? fmt(v) + ' ' + u : fmt(v); }
 function driversTable(rows) {
   if (!rows.length) return '<p class="muted">Needs at least 8 days with a rating.</p>';
-  return `<table class="tbl"><tbody>${rows.slice(0, 8).map((r) => `<tr><td>${esc(r.label)}</td><td style="width:45%"><div class="effbar"><i style="${r.r >= 0 ? 'left:50%' : 'right:50%'};width:${Math.abs(r.r) * 50}%;background:${r.r >= 0 ? css('--blue') : css('--orange')};opacity:${r.p < 0.1 ? 1 : 0.35}"></i></div></td><td class="r num">${r.r > 0 ? '+' : ''}${r.r.toFixed(2)}</td></tr>`).join('')}</tbody></table><p class="small muted">Blue = goes up together, orange = opposite. Faded = not clear yet.</p>`;
+  return `<table class="tbl"><tbody>${rows.slice(0, 8).map((r) => `<tr><td>${esc(r.label)}</td><td style="width:45%"><div class="effbar"><i style="${r.r >= 0 ? 'left:50%' : 'right:50%'};width:${Math.abs(r.r) * 50}%;background:${r.r >= 0 ? css('--blue') : css('--orange')};opacity:${(r.q ?? r.p) < 0.1 ? 1 : 0.35}"></i></div></td><td class="r num">${r.r > 0 ? '+' : ''}${r.r.toFixed(2)}</td></tr>`).join('')}</tbody></table><p class="small muted">Blue = goes up together, orange = opposite. Faded = not clear yet.</p>`;
 }
 
 // ------------------------------------------------------------------------------------

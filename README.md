@@ -25,6 +25,8 @@ the sensors measure.
 | **Training load** | Banister TRIMP from HR. Acute (7d) and chronic (28d) EWMA, their ratio, and a status (Productive, Maintaining, Overreaching, Detraining…) |
 | **Recovery time** | Grows with load. Good sleep makes it shrink faster |
 | **HR zones** | Time in zones 1–5 (% of max HR) per day, per week and per workout |
+| **Body signals** (early warning) | Last night's resting HR, HRV, breathing rate, skin temperature and SpO₂ against your own 28-day baseline (robust z-scores). Two or more signals off together → *watch*, three → *alert* |
+| **Sleep regularity** | Bedtime and wake-time variability over 7 nights (0–100 score), social jetlag (free-day vs. work-day sleep midpoint) and rolling 7-night sleep debt against your target |
 | **VO₂max / fitness age** | Withings Cardio Fitness if your watch reports it, otherwise the Uth estimate (15.3 × HRmax/HRrest) |
 | Plus | Hypnogram, sleeping HR and HRV curves, respiration, SpO₂, snoring, breathing disturbances, steps, calories, weight/body fat, trends over 30–365 days |
 

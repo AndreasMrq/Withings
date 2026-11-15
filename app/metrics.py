@@ -181,6 +181,67 @@ def load_status(acute, chronic, chronic_14d_ago, readiness):
     return "Productive" if trend > 0.05 else "Maintaining"
 
 
+# strain (illness / overload early warning): signal -> (direction that is "worse", scale floor)
+STRAIN_SIGNALS = {"rhr": (1, 1.5), "hrv": (-1, 3.0), "respiration": (1, 0.4), "skin_temp": (1, 0.15), "spo2_night": (-1, 0.5)}
+
+
+def robust_z(value, base_vals, floor, min_n=10):
+    """Robust z-score vs. a baseline (median / 1.4826*MAD, scale floored). Returns (z, median) or None."""
+    base = [x for x in base_vals if x is not None]
+    if value is None or len(base) < min_n:
+        return None
+    med = statistics.median(base)
+    mad = statistics.median([abs(x - med) for x in base])
+    return (value - med) / max(1.4826 * mad, floor), med
+
+
+def strain_assess(zs: dict):
+    """zs: signal -> z where positive = worse. Returns (score 0-100 | None, level | None)."""
+    zs = {k: v for k, v in zs.items() if v is not None}
+    if len(zs) < 2:
+        return None, None
+    v = list(zs.values())
+    score = round(clamp(100 * (sum(max(0.0, z) for z in v) / len(v)) / 2.5, 0, 100))
+    n15, n25 = sum(z >= 1.5 for z in v), sum(z >= 2.5 for z in v)
+    level = "alert" if n15 >= 3 or n25 >= 2 else "watch" if n15 >= 2 else "normal"
+    return score, level
+
+
+def _clock_min(ts, zone, ref=0):
+    """Local clock time of an epoch in minutes, relative to `ref` minutes after midnight (wraps mod 1440)."""
+    t = dt.datetime.fromtimestamp(ts, zone)
+    return (t.hour * 60 + t.minute + t.second / 60 - ref) % 1440
+
+
+def circ_sd_min(mins):
+    """Circular standard deviation (minutes) of clock times given in minutes of a 24 h day."""
+    if len(mins) < 2:
+        return None
+    ang = [x / 1440 * 2 * math.pi for x in mins]
+    R = math.hypot(sum(map(math.cos, ang)), sum(map(math.sin, ang))) / len(ang)
+    return math.sqrt(-2 * math.log(min(1.0, max(R, 1e-9)))) * 1440 / (2 * math.pi)
+
+
+def sleep_regularity(bed_sd, wake_sd):
+    """0-100: 100 when the mean SD <= 15 min, linearly down to 0 at 120 min."""
+    if bed_sd is None or wake_sd is None:
+        return None
+    return round(clamp(100 * (120 - (bed_sd + wake_sd) / 2) / 105, 0, 100))
+
+
+def social_jetlag(free_mids, work_mids):
+    """|mean midpoint free days - mean midpoint work days| in minutes (midpoints relative to noon)."""
+    if len(free_mids) < 2 or len(work_mids) < 2:
+        return None
+    return abs(statistics.mean(free_mids) - statistics.mean(work_mids))
+
+
+def sleep_debt(hours, target_h, min_n=4):
+    """Sum of shortfalls vs. target over nights with data (no banking); None if too few nights."""
+    hs = [h for h in hours if h is not None]
+    return None if len(hs) < min_n else round(sum(max(0.0, target_h - h) for h in hs), 1)
+
+
 def vo2max_uth(hrmax, rhr):
     return 15.3 * hrmax / rhr if rhr else None
 
@@ -309,6 +370,9 @@ def recompute_all() -> int:
     out_days, intraday = [], {}
     hist = {"hrv": [], "rhr": [], "sleep": [], "chronic": []}
     acute_e = chronic_e = None
+    sig_hist = {k: [] for k in STRAIN_SIGNALS}
+    nights = {}  # date -> (sleep_start, sleep_end, hours incl. naps)
+    strain_streak = 0
     energy = 60.0
     recovery = 0.0
 
@@ -431,6 +495,8 @@ def recompute_all() -> int:
         m["workouts"] = sum(1 for w in workouts if a <= w["start"] < b)
 
         # ---- training load EWMA ---------------------------------------------------------
+        # acwr as of the end of the previous day: morning readiness must not see today's training
+        acwr_prev = acute_e / chronic_e if acute_e is not None and chronic_e and chronic_e * 7 >= 30 else None
         acute_e = load if acute_e is None else acute_e + (load - acute_e) * (2 / 8)
         chronic_e = load if chronic_e is None else chronic_e + (load - chronic_e) * (2 / 29)
         acute, chronic = acute_e * 7, chronic_e * 7
@@ -444,7 +510,7 @@ def recompute_all() -> int:
         rd, rd_parts = readiness_score(
             m.get("sleep_score"), hrv_ratio,
             (rhr - rhr_base) if rhr and rhr_base else None,
-            rec_morning, acwr, sleep_hist)
+            rec_morning, acwr_prev, sleep_hist)
         m.update({"readiness": rd, "readiness_label": readiness_label(rd), "readiness_parts": rd_parts})
 
         speed = 0.7 + 0.5 * ((m.get("sleep_score") or 70) / 100)
@@ -453,6 +519,44 @@ def recompute_all() -> int:
             "load_acute": round(acute), "load_chronic": round(chronic),
             "acwr": r1(acwr, 2), "load_status": load_status(acute, chronic, chronic_14, rd),
             "recovery_h": round(recovery),
+        })
+
+        # ---- strain: overnight signals vs. own trailing 28-day baseline (excl. today) -------
+        zs, ssig = {}, {}
+        for k, (sign, floor) in STRAIN_SIGNALS.items():
+            rz = robust_z(m.get(k), sig_hist[k][-28:], floor)
+            if rz:
+                zs[k] = sign * rz[0]
+                ssig[k] = {"value": m[k], "baseline": r1(rz[1], 2), "z": round(zs[k], 1)}
+        sscore, slevel = strain_assess(zs)
+        strain_streak = strain_streak + 1 if slevel in ("watch", "alert") else 0
+        m.update({"strain_signals": ssig, "strain_score": sscore, "strain_level": slevel,
+                  "strain_streak": strain_streak})
+        for k in STRAIN_SIGNALS:
+            if m.get(k) is not None:
+                sig_hist[k].append(m[k])
+
+        # ---- sleep regularity / social jetlag / debt ----------------------------------------
+        if main:
+            nights[d] = (main["start"], main["end"], ((m.get("sleep_total_s") or 0) + (m.get("naps_s") or 0)) / 3600)
+        w7 = [nights[d - dt.timedelta(days=i)] for i in range(7) if d - dt.timedelta(days=i) in nights]
+        bsd = wsd = None
+        if len(w7) >= 4:
+            bsd = circ_sd_min([_clock_min(n[0], zone) for n in w7])
+            wsd = circ_sd_min([_clock_min(n[1], zone) for n in w7])
+        free, work = [], []
+        for i in range(28):
+            dd = d - dt.timedelta(days=i)
+            if dd in nights:
+                n = nights[dd]
+                (free if dd.weekday() >= 5 else work).append(_clock_min((n[0] + n[1]) / 2, zone, 720))
+        sjl = social_jetlag(free, work)
+        m.update({
+            "bedtime_sd_min": None if bsd is None else round(bsd), "waketime_sd_min": None if wsd is None else round(wsd),
+            "sleep_midpoint_min": round(_clock_min((main["start"] + main["end"]) / 2, zone)) if main else None,
+            "social_jetlag_min": None if sjl is None else round(sjl), "sleep_regularity": sleep_regularity(bsd, wsd),
+            "sleep_debt_h": sleep_debt([nights[d - dt.timedelta(days=i)][2] for i in range(7)
+                                        if d - dt.timedelta(days=i) in nights], target_h),
         })
 
         # ---- body energy simulation -----------------------------------------------------
