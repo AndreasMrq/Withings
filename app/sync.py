@@ -141,6 +141,9 @@ def sync_sleep(start: int, end: int) -> int:
                 for ts, v in _series_items(seg.get(key)):
                     series.setdefault(ts, {})[col] = v
         with db.tx() as c:
+            if states:  # re-segmented nights: drop stale stages/series (keep them on an empty reply)
+                c.execute("DELETE FROM sleep_states WHERE start>=? AND start<?", (s["startdate"], s["enddate"]))
+                c.execute("DELETE FROM sleep_series WHERE ts>=? AND ts<?", (s["startdate"], s["enddate"]))
             c.executemany("INSERT OR REPLACE INTO sleep_states(start,end,state) VALUES (?,?,?)", states)
             c.executemany("INSERT OR REPLACE INTO hr(ts,bpm,src) VALUES (?,?,?)", hr_rows)
             c.executemany(

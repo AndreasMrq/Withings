@@ -153,6 +153,8 @@ def withings_callback(background: BackgroundTasks, code: str = "", state: str = 
     withings.exchange_code(code)
     if db.kv_get("demo"):  # switching from demo data to real data
         _wipe_sensor_data()
+        with db.tx() as c:  # synthetic demo journal would pollute real insights
+            c.execute("DELETE FROM journal")
         db.kv_set("demo", False)
     if config.WITHINGS_NOTIFY:
         try:
@@ -169,10 +171,15 @@ def withings_disconnect():
     return {"ok": True}
 
 
+_last_notify = 0.0  # monotonic time of the last notify-triggered sync
+
+
 @app.api_route("/api/withings/notify", methods=["GET", "HEAD", "POST"])
 async def withings_notify(request: Request, background: BackgroundTasks):
     # Withings calls this when the watch synced new data. Respond fast, sync in background.
-    if request.method == "POST" and withings.connected():
+    global _last_notify
+    if request.method == "POST" and withings.connected() and time.monotonic() - _last_notify >= 60:
+        _last_notify = time.monotonic()  # public endpoint: debounce
         background.add_task(sync.run_sync)
     return Response(status_code=200)
 
@@ -202,6 +209,9 @@ def _wipe_sensor_data():
 def load_demo(days: int = 150):
     if withings.connected():
         raise HTTPException(400, "Disconnect Withings before loading demo data")
+    if not db.kv_get("demo") and any(
+            db.q1(f"SELECT 1 FROM {t} LIMIT 1") for t in ("daily_metrics", "hr", "sleep_sessions", "journal")):
+        raise HTTPException(400, "Real data is stored; loading demo data would erase it")
     from . import demo
     demo.generate(days=days)
     return {"ok": True}
@@ -209,6 +219,8 @@ def load_demo(days: int = 150):
 
 @app.delete("/api/demo")
 def clear_demo():
+    if not db.kv_get("demo"):
+        raise HTTPException(400, "Demo mode is not active")
     _wipe_sensor_data()
     with db.tx() as c:
         c.execute("DELETE FROM journal")
@@ -311,7 +323,10 @@ def journal_add(e: EntryIn):
 
 @app.put("/api/journal/{eid}")
 def journal_update(eid: int, e: EntryIn):
-    r = insights.update_entry(eid, e.ts or int(time.time()), e.mood, e.energy, e.tags, e.note)
+    old = db.q1("SELECT ts FROM journal WHERE id=?", (eid,))
+    if not old:
+        raise HTTPException(404)
+    r = insights.update_entry(eid, e.ts or old[0], e.mood, e.energy, e.tags, e.note)
     if not r:
         raise HTTPException(404)
     return r
@@ -347,7 +362,7 @@ def tags_delete(name: str):
 
 @app.get("/api/insights")
 def get_insights(min_n: int = 3):
-    return insights.analyze(min_n=min_n)
+    return insights.analyze(min_n=max(2, min_n))
 
 
 # --------------------------------------------------------------------------------------
@@ -358,7 +373,8 @@ def get_insights(min_n: int = 3):
 def export_daily():
     rows = metrics.daily()
     keys = sorted({k for r in rows for k, v in r.items() if not isinstance(v, (dict, list))})
-    keys.remove("date")
+    if rows:
+        keys.remove("date")
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["date"] + keys)
