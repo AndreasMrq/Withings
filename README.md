@@ -34,7 +34,7 @@ the sensors measure.
 - Tap **+** anywhere (or open `/log` / the home-screen shortcut). Pick a mood (1–5), an energy level (1–5), any tags, and add an optional note. Every field is optional, so one tap on a tag is a valid entry.
 - Add your own tags at any time; new tags become quick-pick chips.
 - Entries made before 04:00 count toward the previous day, so late drinks land on the right evening.
-- **Insights** compares every tag's days with all other days on 14 metrics: the night before, the same day, and the night/morning after. It uses Welch's t-test and Cohen's d and writes the results in plain language, e.g. *"HRV that night was 27% lower on 'alcohol' days (37 ms vs 51 ms, n=25)"*. It also ranks which sensor metrics correlate with your mood and felt energy (Spearman).
+- **Insights** compares every tag's days with the other days you logged on 14 metrics: the night before, the same day, and the night/morning after. It uses Welch's t-test and Cohen's d, corrects for the number of comparisons (Benjamini-Hochberg), and writes the results in plain language, e.g. *"HRV that night was 27% lower on 'alcohol' days (37 ms vs 51 ms, n=25)"*. It also ranks which sensor metrics correlate with your mood and felt energy (Spearman).
 
 ## Quick start
 
